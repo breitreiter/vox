@@ -5,6 +5,7 @@ public class VoxConfig
     public WhisperConfig Whisper { get; set; } = new();
     public AudioConfig Audio { get; set; } = new();
     public ClipboardConfig Clipboard { get; set; } = new();
+    public LlmConfig Llm { get; set; } = new();
 }
 
 public class WhisperConfig
@@ -25,4 +26,13 @@ public class AudioConfig
 public class ClipboardConfig
 {
     public bool Enabled { get; set; } = true;
+}
+
+public class LlmConfig
+{
+    public bool Enabled { get; set; } = true;
+    public string ModeToggleKey { get; set; } = "Tab";
+    public string Provider { get; set; } = "Anthropic";
+    public string? ApiKey { get; set; }
+    public string Model { get; set; } = "claude-sonnet-4-20250514";
 }

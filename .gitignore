@@ -40,3 +40,6 @@ coverage/
 
 # Publish output
 publish/
+
+# Configuration with secrets
+appsettings.json

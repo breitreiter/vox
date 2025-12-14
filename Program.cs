@@ -1,18 +1,65 @@
 ﻿using System.Diagnostics;
 using System.Text;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Pv;
 using Spectre.Console;
 using TextCopy;
+using Vox.Providers;
 using Whisper.net;
 using Whisper.net.Ggml;
 
 namespace Vox;
 
+public enum RecordingMode { Content, Instruction }
+
+public static class MarkupHelper
+{
+    /// <summary>
+    /// Escapes text for safe use in Spectre.Console markup strings.
+    /// Handles both user content and any text that might contain markup-like characters.
+    /// </summary>
+    public static string Sanitize(string text)
+    {
+        return text.Replace("[", "[[").Replace("]", "]]");
+    }
+}
+
+public class ModeToggleEvent
+{
+    public TimeSpan Timestamp { get; set; }
+    public RecordingMode Mode { get; set; }
+}
+
+public class RecordingResult
+{
+    public short[] AudioData { get; set; } = Array.Empty<short>();
+    public List<ModeToggleEvent> ToggleEvents { get; set; } = new();
+    public TimeSpan TotalDuration { get; set; }
+}
+
+public class TranscriptionSegment
+{
+    public TimeSpan Start { get; set; }
+    public TimeSpan End { get; set; }
+    public string Text { get; set; } = "";
+}
+
+public class LabeledSegment
+{
+    public string Text { get; set; } = "";
+    public RecordingMode Mode { get; set; }
+    public TimeSpan Start { get; set; }
+    public TimeSpan End { get; set; }
+}
+
 internal class Program
 {
     private static async Task<int> Main(string[] args)
     {
+        // Preamble
+        AnsiConsole.MarkupLine("🎙️[grey]vox 0.1α[/]");
+        
         // Handle command-line flags
         if (args.Contains("--help") || args.Contains("-h"))
         {
@@ -67,8 +114,14 @@ internal class Program
         AnsiConsole.MarkupLine("[bold cyan]Quick Start[/]");
         AnsiConsole.MarkupLine("  [grey]1.[/] Run [cyan]vox[/] to start recording");
         AnsiConsole.MarkupLine("  [grey]2.[/] Speak into your microphone");
-        AnsiConsole.MarkupLine("  [grey]3.[/] Press [cyan]ENTER[/] when done");
-        AnsiConsole.MarkupLine("  [grey]4.[/] Transcription is printed and copied to clipboard");
+        AnsiConsole.MarkupLine("  [grey]3.[/] Press [cyan]TAB[/] to toggle between Content/Instruction mode");
+        AnsiConsole.MarkupLine("  [grey]4.[/] Press [cyan]ENTER[/] when done");
+        AnsiConsole.MarkupLine("  [grey]5.[/] Transcription is printed and copied to clipboard");
+        AnsiConsole.WriteLine();
+
+        AnsiConsole.MarkupLine("[bold cyan]Modes[/]");
+        AnsiConsole.MarkupLine("  [green]Content[/] - Text for final output (default mode)");
+        AnsiConsole.MarkupLine("  [yellow]Instruction[/] - Directions for processing the content");
         AnsiConsole.WriteLine();
 
         AnsiConsole.MarkupLine("[dim]Configuration: ~/.vox/models/ (model cache)[/]");
@@ -260,35 +313,75 @@ internal class Program
             var modelPath = await EnsureModelDownloaded(config);
 
             // Record audio
-            AnsiConsole.MarkupLine("[cyan]Listening[/] on default audio device...");
-            AnsiConsole.MarkupLine("[dim]Press ENTER when you're done speaking.[/]");
+            AnsiConsole.MarkupLine("[dim]Press TAB to change input modes. Press ENTER when done speaking.[/]");
 
-            var audioData = RecordAudio(config);
+            var recordingResult = RecordAudio(config);
 
-            if (audioData.Length == 0)
+            if (recordingResult.AudioData.Length == 0)
             {
                 AnsiConsole.MarkupLine("[red]No audio detected.[/]");
                 return 1;
             }
 
             // Transcribe
-            var transcription = "";
+            List<TranscriptionSegment> segments = new();
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
                 .SpinnerStyle(Style.Parse("cyan"))
                 .StartAsync("[cyan]Transcribing...[/]",
-                    async ctx => { transcription = await TranscribeAudio(modelPath, audioData, config); });
+                    async ctx => { segments = await TranscribeAudio(modelPath, recordingResult.AudioData, config); });
 
-            // Output results
+            // Map segments to modes based on toggle events
+            var labeledSegments = MapSegmentsToModes(segments, recordingResult.ToggleEvents);
+
+            // Format for LLM
+            var (instruction, content) = FormatSegmentsAsXml(labeledSegments);
+
+            // ALWAYS show raw transcription with mode labels (for transparency)
             AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[bold cyan]Transcription:[/]");
-            AnsiConsole.WriteLine(transcription);
+            AnsiConsole.MarkupLine("[bold cyan]Raw Transcription:[/]");
+            foreach (var segment in labeledSegments)
+            {
+                var modeColor = segment.Mode == RecordingMode.Content ? "green" : "yellow";
+                var modeName = MarkupHelper.Sanitize(segment.Mode.ToString());
+                var segmentText = MarkupHelper.Sanitize(segment.Text);
+                AnsiConsole.MarkupLine($"[{modeColor}]{modeName}:[/] {segmentText}");
+            }
+            AnsiConsole.WriteLine();
+
+            // Process with LLM if enabled
+            string finalText;
+            if (config.Llm.Enabled && !string.IsNullOrEmpty(config.Llm.ApiKey))
+            {
+                // If there are instructions, process normally
+                // If no instructions, just show content and allow revisions
+                if (!string.IsNullOrEmpty(instruction))
+                {
+                    finalText = await ProcessWithLlm(config, modelPath, instruction, content);
+                }
+                else
+                {
+                    // No initial instructions, but allow revisions
+                    AnsiConsole.WriteLine();
+                    AnsiConsole.MarkupLine("[bold cyan]Result:[/]");
+                    AnsiConsole.WriteLine(content);
+                    AnsiConsole.WriteLine();
+
+                    finalText = await ProcessRevisionsOnly(config, modelPath, content);
+                }
+            }
+            else
+            {
+                // No LLM available
+                finalText = content;
+            }
+
             AnsiConsole.WriteLine();
 
             // Copy to clipboard
             if (config.Clipboard.Enabled)
             {
-                await ClipboardService.SetTextAsync(transcription);
+                await ClipboardService.SetTextAsync(finalText);
                 AnsiConsole.MarkupLine("[green]✓ Copied to clipboard[/]");
             }
 
@@ -296,9 +389,289 @@ internal class Program
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {ex.Message.EscapeMarkup()}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {MarkupHelper.Sanitize(ex.Message)}");
             return 1;
         }
+    }
+
+    private static (string? instruction, string content) FormatSegmentsAsXml(
+        List<LabeledSegment> labeledSegments)
+    {
+        var contentBuilder = new StringBuilder();
+        var instructionBuilder = new StringBuilder();
+
+        foreach (var segment in labeledSegments)
+        {
+            if (segment.Mode == RecordingMode.Content)
+            {
+                contentBuilder.AppendLine(segment.Text.Trim());
+            }
+            else // RecordingMode.Instruction
+            {
+                instructionBuilder.AppendLine(segment.Text.Trim());
+            }
+        }
+
+        var content = contentBuilder.ToString().Trim();
+        var instruction = instructionBuilder.ToString().Trim();
+
+        return (
+            string.IsNullOrEmpty(instruction) ? null : instruction,
+            content
+        );
+    }
+
+    private static async Task<string> ProcessRevisionsOnly(VoxConfig config, string modelPath, string initialText)
+    {
+        // Initialize LLM client
+        var llmConfig = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["ApiKey"] = config.Llm.ApiKey,
+                ["Model"] = config.Llm.Model
+            })
+            .Build();
+
+        var provider = new AnthropicProvider();
+        if (!provider.CanCreate(llmConfig))
+        {
+            return initialText;
+        }
+
+        var chatClient = provider.CreateClient(llmConfig);
+        var systemPrompt = BuildSystemPrompt(null);
+        var currentText = initialText;
+
+        // Enter revision loop
+        while (true)
+        {
+            AnsiConsole.MarkupLine("[dim]Press ENTER to revise/append, or ESC to accept and exit.[/]");
+
+            var key = Console.ReadKey(true);
+            if (key.Key == ConsoleKey.Escape)
+            {
+                break;
+            }
+            else if (key.Key != ConsoleKey.Enter)
+            {
+                continue;
+            }
+
+            // Record revision (same flow as initial recording)
+            AnsiConsole.MarkupLine("[dim]Press TAB to change input modes. Press ENTER when done speaking.[/]");
+
+            var revisionResult = RecordAudio(config);
+
+            if (revisionResult.AudioData.Length == 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]No audio detected, keeping current version.[/]");
+                break;
+            }
+
+            // Transcribe revision
+            List<TranscriptionSegment> revisionSegments = new();
+            await AnsiConsole.Status()
+                .Spinner(Spinner.Known.Dots)
+                .SpinnerStyle(Style.Parse("cyan"))
+                .StartAsync("[cyan]Transcribing...[/]",
+                    async ctx => { revisionSegments = await TranscribeAudio(modelPath, revisionResult.AudioData, config); });
+
+            // Map segments to modes
+            var revisionLabeledSegments = MapSegmentsToModes(revisionSegments, revisionResult.ToggleEvents);
+            var (revisionInstruction, revisionContent) = FormatSegmentsAsXml(revisionLabeledSegments);
+
+            // Append any new content to current text
+            if (!string.IsNullOrEmpty(revisionContent))
+            {
+                currentText = currentText + "\n\n" + revisionContent;
+            }
+
+            // Apply any instructions
+            if (!string.IsNullOrEmpty(revisionInstruction))
+            {
+                await AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .SpinnerStyle(Style.Parse("cyan"))
+                    .StartAsync("[cyan]Applying revision...[/]",
+                        async ctx => { currentText = await CallLlm(chatClient, systemPrompt, currentText, revisionInstruction); });
+            }
+
+            // Show updated result
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]Updated:[/]");
+            AnsiConsole.WriteLine(currentText);
+            AnsiConsole.WriteLine();
+        }
+
+        return currentText;
+    }
+
+    private static async Task<string> ProcessWithLlm(VoxConfig config, string modelPath, string? instruction,
+        string content)
+    {
+        // Initialize LLM client
+        IChatClient? chatClient = null;
+        try
+        {
+            var llmConfig = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["ApiKey"] = config.Llm.ApiKey,
+                    ["Model"] = config.Llm.Model
+                })
+                .Build();
+
+            var provider = new AnthropicProvider();
+            if (!provider.CanCreate(llmConfig))
+            {
+                AnsiConsole.MarkupLine("[yellow]⚠ LLM not configured properly, using raw transcription[/]");
+                return content;
+            }
+
+            chatClient = provider.CreateClient(llmConfig);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[yellow]⚠ Failed to initialize LLM: {MarkupHelper.Sanitize(ex.Message)}[/]");
+            return content;
+        }
+
+        // Build system prompt
+        var systemPrompt = BuildSystemPrompt(instruction);
+
+        // Initial processing
+        var currentText = "";
+        await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .SpinnerStyle(Style.Parse("cyan"))
+            .StartAsync("[cyan]Processing with LLM...[/]",
+                async ctx => { currentText = await CallLlm(chatClient, systemPrompt, content, null); });
+
+        // Show result
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[bold cyan]Result:[/]");
+        AnsiConsole.WriteLine(currentText);
+        AnsiConsole.WriteLine();
+
+        // Enter revision loop
+        while (true)
+        {
+            AnsiConsole.MarkupLine("[dim]Press ENTER to revise, or ESC to accept and exit.[/]");
+
+            // Check if user wants to revise
+            var key = Console.ReadKey(true);
+            if (key.Key == ConsoleKey.Escape)
+            {
+                // Exit revision loop
+                break;
+            }
+            else if (key.Key != ConsoleKey.Enter)
+            {
+                // Ignore other keys, wait for Enter or Escape
+                continue;
+            }
+
+            // Record revision (same flow as initial recording)
+            AnsiConsole.MarkupLine("[dim]Press TAB to change input modes. Press ENTER when done speaking.[/]");
+
+            var revisionResult = RecordAudio(config);
+
+            if (revisionResult.AudioData.Length == 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]No audio detected, keeping current version.[/]");
+                break;
+            }
+
+            // Transcribe revision
+            List<TranscriptionSegment> revisionSegments = new();
+            await AnsiConsole.Status()
+                .Spinner(Spinner.Known.Dots)
+                .SpinnerStyle(Style.Parse("cyan"))
+                .StartAsync("[cyan]Transcribing...[/]",
+                    async ctx => { revisionSegments = await TranscribeAudio(modelPath, revisionResult.AudioData, config); });
+
+            // Map segments to modes
+            var revisionLabeledSegments = MapSegmentsToModes(revisionSegments, revisionResult.ToggleEvents);
+            var (revisionInstruction, revisionContent) = FormatSegmentsAsXml(revisionLabeledSegments);
+
+            // Append any new content to current text
+            if (!string.IsNullOrEmpty(revisionContent))
+            {
+                currentText = currentText + "\n\n" + revisionContent;
+            }
+
+            // Apply any instructions
+            if (!string.IsNullOrEmpty(revisionInstruction))
+            {
+                await AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .SpinnerStyle(Style.Parse("cyan"))
+                    .StartAsync("[cyan]Applying revision...[/]",
+                        async ctx => { currentText = await CallLlm(chatClient, systemPrompt, currentText, revisionInstruction); });
+            }
+
+            // Show updated result
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]Updated:[/]");
+            AnsiConsole.WriteLine(currentText);
+            AnsiConsole.WriteLine();
+        }
+
+        return currentText;
+    }
+
+    private static string BuildSystemPrompt(string? instruction)
+    {
+        var prompt = new StringBuilder();
+        prompt.AppendLine(
+            "You are a transcription refinement assistant. Your job is to refine spoken text into written prose.");
+        prompt.AppendLine();
+        prompt.AppendLine("CRITICAL GUIDELINES:");
+        prompt.AppendLine("- You are generating text AS the user, not FOR the user");
+        prompt.AppendLine("- Preserve the user's voice, tone, and style");
+        prompt.AppendLine("- Do NOT transform into corporate-speak or 'AI slop'");
+        prompt.AppendLine("- Only apply requested changes, don't over-edit");
+        prompt.AppendLine("- Remove filler words (um, uh, like) unless they add meaning");
+        prompt.AppendLine("- Fix grammar and punctuation for written form");
+        prompt.AppendLine();
+
+        if (!string.IsNullOrEmpty(instruction))
+        {
+            prompt.AppendLine("INSTRUCTIONS FROM USER:");
+            prompt.AppendLine(instruction);
+            prompt.AppendLine();
+        }
+
+        prompt.AppendLine("When revising, apply ONLY the requested changes. Return only the refined text, no explanations.");
+
+        return prompt.ToString();
+    }
+
+    private static async Task<string> CallLlm(IChatClient client, string systemPrompt, string content,
+        string? revisionRequest)
+    {
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.System, systemPrompt)
+        };
+
+        if (string.IsNullOrEmpty(revisionRequest))
+        {
+            // Initial processing
+            messages.Add(new ChatMessage(ChatRole.User, $"Refine this spoken text:\n\n{content}"));
+        }
+        else
+        {
+            // Revision
+            messages.Add(new ChatMessage(ChatRole.User, $"Current text:\n\n{content}"));
+            messages.Add(new ChatMessage(ChatRole.User, $"Revision request: {revisionRequest}"));
+        }
+
+        var response = await client.GetResponseAsync(messages);
+
+        // Extract text from the first message in the response
+        var firstMessage = response.Messages.FirstOrDefault();
+        return firstMessage?.Text ?? content;
     }
 
     private static string GetModelPath(VoxConfig config)
@@ -408,9 +781,23 @@ internal class Program
         };
     }
 
-    private static short[] RecordAudio(VoxConfig config)
+    private static string GetModeDescription(RecordingMode mode)
+    {
+        return mode switch
+        {
+            RecordingMode.Content => "text for final output",
+            RecordingMode.Instruction => "directions for processing",
+            _ => ""
+        };
+    }
+
+    private static RecordingResult RecordAudio(VoxConfig config)
     {
         var audioBuffer = new List<short>();
+        var toggleEvents = new List<ModeToggleEvent>();
+        var currentMode = RecordingMode.Content;
+        var startTime = DateTime.UtcNow;
+        var recording = true;
 
         using var recorder = PvRecorder.Create(
             deviceIndex: -1, // -1 = default device
@@ -419,23 +806,65 @@ internal class Program
 
         recorder.Start();
 
-        // Record until user presses Enter
-        var recordingTask = Task.Run(() =>
+        // Log initial mode
+        var logMode = (RecordingMode mode, TimeSpan elapsed) =>
         {
-            while (!Console.KeyAvailable || Console.ReadKey(true).Key != ConsoleKey.Enter)
-            {
-                var frame = recorder.Read();
-                audioBuffer.AddRange(frame);
-            }
-        });
+            var color = mode == RecordingMode.Content ? "green" : "yellow";
+            var desc = GetModeDescription(mode);
+            var modeType = mode == RecordingMode.Content ? "content" : "instructions";
+            AnsiConsole.MarkupLine($"[gray][[{elapsed:mm\\:ss}]][/] [{color}]Listening for {modeType}[/][gray] ({desc})[/]");
+        };
 
-        recordingTask.Wait();
+        logMode(currentMode, TimeSpan.Zero);
+
+        // Record with keyboard input handling
+        while (recording)
+        {
+            if (Console.KeyAvailable)
+            {
+                var key = Console.ReadKey(true);
+
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    recording = false;
+                    break;
+                }
+                else if (key.Key == ConsoleKey.Tab)
+                {
+                    // Toggle mode
+                    var elapsed = DateTime.UtcNow - startTime;
+                    currentMode = currentMode == RecordingMode.Content
+                        ? RecordingMode.Instruction
+                        : RecordingMode.Content;
+
+                    toggleEvents.Add(new ModeToggleEvent
+                    {
+                        Timestamp = elapsed,
+                        Mode = currentMode
+                    });
+
+                    // Log mode change
+                    logMode(currentMode, elapsed);
+                }
+            }
+
+            var frame = recorder.Read();
+            audioBuffer.AddRange(frame);
+        }
+
         recorder.Stop();
 
-        return audioBuffer.ToArray();
+        var totalDuration = DateTime.UtcNow - startTime;
+
+        return new RecordingResult
+        {
+            AudioData = audioBuffer.ToArray(),
+            ToggleEvents = toggleEvents,
+            TotalDuration = totalDuration
+        };
     }
 
-    private static async Task<string> TranscribeAudio(string modelPath, short[] audioData, VoxConfig config)
+    private static async Task<List<TranscriptionSegment>> TranscribeAudio(string modelPath, short[] audioData, VoxConfig config)
     {
         try
         {
@@ -447,11 +876,19 @@ internal class Program
                 .WithLanguage(config.Whisper.Language)
                 .Build();
 
-            var transcription = new StringBuilder();
+            var segments = new List<TranscriptionSegment>();
 
-            await foreach (var result in processor.ProcessAsync(floatSamples)) transcription.Append(result.Text);
+            await foreach (var result in processor.ProcessAsync(floatSamples))
+            {
+                segments.Add(new TranscriptionSegment
+                {
+                    Start = result.Start,
+                    End = result.End,
+                    Text = result.Text
+                });
+            }
 
-            return transcription.ToString().Trim();
+            return segments;
         }
         catch (Exception ex)
         {
@@ -459,5 +896,83 @@ internal class Program
                 $"Transcription failed: {ex.Message}\nModel path: {modelPath}\nInner: {ex.InnerException?.Message}",
                 ex);
         }
+    }
+
+    private static List<LabeledSegment> MapSegmentsToModes(
+        List<TranscriptionSegment> segments,
+        List<ModeToggleEvent> toggleEvents)
+    {
+        // Build mode timeline: starts with Content at 0:00, then add all toggle events
+        var modeTimeline = new List<ModeToggleEvent>
+        {
+            new() { Timestamp = TimeSpan.Zero, Mode = RecordingMode.Content }
+        };
+        modeTimeline.AddRange(toggleEvents);
+
+        // Label each segment with its mode
+        var labeledSegments = new List<LabeledSegment>();
+
+        foreach (var segment in segments)
+        {
+            // Find the active mode at segment's midpoint
+            var segmentMidpoint = segment.Start + TimeSpan.FromTicks((segment.End - segment.Start).Ticks / 2);
+
+            // Find the last toggle before or at the midpoint
+            var activeMode = RecordingMode.Content;
+            foreach (var toggle in modeTimeline)
+            {
+                if (toggle.Timestamp <= segmentMidpoint)
+                {
+                    activeMode = toggle.Mode;
+                }
+                else
+                {
+                    break; // Toggles are chronological
+                }
+            }
+
+            labeledSegments.Add(new LabeledSegment
+            {
+                Text = segment.Text,
+                Mode = activeMode,
+                Start = segment.Start,
+                End = segment.End
+            });
+        }
+
+        // Merge consecutive segments with same mode
+        var mergedSegments = new List<LabeledSegment>();
+        LabeledSegment? current = null;
+
+        foreach (var segment in labeledSegments)
+        {
+            if (current == null || current.Mode != segment.Mode)
+            {
+                if (current != null)
+                {
+                    mergedSegments.Add(current);
+                }
+                current = new LabeledSegment
+                {
+                    Text = segment.Text,
+                    Mode = segment.Mode,
+                    Start = segment.Start,
+                    End = segment.End
+                };
+            }
+            else
+            {
+                // Merge with current segment
+                current.Text += " " + segment.Text;
+                current.End = segment.End;
+            }
+        }
+
+        if (current != null)
+        {
+            mergedSegments.Add(current);
+        }
+
+        return mergedSegments;
     }
 }

@@ -2,13 +2,19 @@
 
 Minimal friction voice transcription for the command line.
 
-> In December 2025, I had an arm injury and needed speech-to-text. I wasn't happy with any of the existing options out
-> there. So here we are.
+In December 2025, I had an arm injury and needed speech-to-text. I wasn't happy with any of the existing tools. 
+
+I started with vanilla transcription, but found that was a pretty unpleasant way of working. So I added the current transcribe/refine loop, which seems to work pretty well.
 
 ## What is vox?
 
-vox is a simple CLI tool that records audio from your microphone, transcribes it locally using OpenAI's Whisper model,
-and copies the result to your clipboard.
+vox is a CLI tool that:
+1. Records audio from your microphone
+2. Transcribes it locally using OpenAI's Whisper model
+3. Optionally processes it with an LLM (Claude)
+4. Copies the result to your clipboard
+
+During recording, toggle between **Content** mode (text you want in the output) and **Instruction** mode (directions for how to process that text) with the TAB key. 
 
 ## Installation
 
@@ -41,13 +47,19 @@ Subsequent runs are instant—no download needed.
 
 ## Usage
 
-**Basic usage:**
+**Basic transcription:**
 
 ```bash
 vox
 ```
 
-Speak into your microphone, press Enter when done. Transcription is printed and copied to clipboard.
+1. Speak into your microphone
+2. Press **Tab** to toggle between Content and Instruction modes
+3. Press **Enter** when done speaking
+4. Review the raw transcription
+5. If LLM is enabled and you provided instructions, review the processed result
+6. Press **Enter** to append more content or give new instructions
+7. Press **Escape** to accept and copy to clipboard
 
 **List audio devices:**
 
@@ -85,9 +97,21 @@ Configuration is stored in `appsettings.json`:
   },
   "clipboard": {
     "enabled": true
+  },
+  "llm": {
+    "enabled": true,             // enable LLM processing
+    "modeToggleKey": "Tab",      // key to toggle between content/instruction modes
+    "provider": "Anthropic",     // currently only Anthropic (Claude) is supported
+    "apiKey": null,              // your Anthropic API key (or set ANTHROPIC_API_KEY env var)
+    "model": "claude-sonnet-4-20250514"
   }
 }
 ```
+
+**LLM Processing:**
+- Set `llm.enabled` to `false` to disable LLM features (transcription only)
+- Set `llm.apiKey` to your Anthropic API key to enable processing
+- When enabled, you can toggle to Instruction mode to tell Claude how to process your text
 
 ### Model Sizes
 
@@ -186,10 +210,10 @@ Check your microphone:
 ## FAQ
 
 **Q: Does this require an internet connection?**
-A: Only for the initial model download. After that, everything runs locally.
+A: Only for the initial Whisper model download. After that, transcription runs locally. If you enable LLM processing, it makes API calls to Anthropic.
 
 **Q: Does this send my audio anywhere?**
-A: No. All processing happens locally on your machine.
+A: No. Audio is transcribed locally. Only the text (not audio) is sent to Claude if you enable LLM processing.
 
 **Q: Can I use this with a different language?**
 A: Yes! Change the `language` setting in `appsettings.json`. Whisper supports many languages.
@@ -207,29 +231,14 @@ A: `~/.vox/models/` (Linux/macOS) or `%USERPROFILE%\.vox\models\` (Windows)
 **Q: Can I use multiple models?**
 A: Yes. Change `modelSize` in `appsettings.json`. Each model downloads separately and they coexist in the cache.
 
-## License
+**Q: Do I need an Anthropic API key?**
+A: Only if you want LLM processing. Set `llm.enabled` to `false` for transcription-only mode.
 
-MIT License
+**Q: How does mode switching work?**
+A: Press Tab during recording to toggle between Content (text output) and Instruction (processing directions). The tool uses Whisper's segment timestamps to map which parts were spoken in which mode.
 
-Copyright (c) 2025
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+**Q: Can I just use this for transcription without any LLM features?**
+A: Yes. Set `llm.enabled` to `false` in `appsettings.json`. You'll get raw transcription copied to clipboard.
 
 ## Credits
 
@@ -237,3 +246,4 @@ SOFTWARE.
 - Uses [OpenAI Whisper](https://github.com/openai/whisper) models
 - Audio recording via [PvRecorder](https://github.com/Picovoice/pvrecorder)
 - UI powered by [Spectre.Console](https://github.com/spectreconsole/spectre.console)
+- LLM integration via [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-dotnet)
