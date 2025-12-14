@@ -1,0 +1,42 @@
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# Clawd
+.claude/
+
+# VS Code
+.vscode/
+
+# OS / editor junk
+*.swp
+*.tmp
+*~
+.DS_Store
+
+# Test results / coverage
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/packages/
+
+# Logs
+*.log
+
+# Publish output
+publish/
