@@ -312,71 +312,13 @@ internal class Program
             // Ensure model is downloaded
             var modelPath = await EnsureModelDownloaded(config);
 
-            // Record audio
-            AnsiConsole.MarkupLine("[dim]Press TAB to change input modes. Press ENTER when done speaking.[/]");
+            // Run the unified transcription loop
+            var finalText = await ProcessTranscriptionLoop(config, modelPath);
 
-            var recordingResult = RecordAudio(config);
-
-            if (recordingResult.AudioData.Length == 0)
+            if (string.IsNullOrEmpty(finalText))
             {
-                AnsiConsole.MarkupLine("[red]No audio detected.[/]");
                 return 1;
             }
-
-            // Transcribe
-            List<TranscriptionSegment> segments = new();
-            await AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .SpinnerStyle(Style.Parse("cyan"))
-                .StartAsync("[cyan]Transcribing...[/]",
-                    async ctx => { segments = await TranscribeAudio(modelPath, recordingResult.AudioData, config); });
-
-            // Map segments to modes based on toggle events
-            var labeledSegments = MapSegmentsToModes(segments, recordingResult.ToggleEvents);
-
-            // Format for LLM
-            var (instruction, content) = FormatSegmentsAsXml(labeledSegments);
-
-            // ALWAYS show raw transcription with mode labels (for transparency)
-            AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[bold cyan]Raw Transcription:[/]");
-            foreach (var segment in labeledSegments)
-            {
-                var modeColor = segment.Mode == RecordingMode.Content ? "green" : "yellow";
-                var modeName = MarkupHelper.Sanitize(segment.Mode.ToString());
-                var segmentText = MarkupHelper.Sanitize(segment.Text);
-                AnsiConsole.MarkupLine($"[{modeColor}]{modeName}:[/] {segmentText}");
-            }
-            AnsiConsole.WriteLine();
-
-            // Process with LLM if enabled
-            string finalText;
-            if (config.Llm.Enabled && !string.IsNullOrEmpty(config.Llm.ApiKey))
-            {
-                // If there are instructions, process normally
-                // If no instructions, just show content and allow revisions
-                if (!string.IsNullOrEmpty(instruction))
-                {
-                    finalText = await ProcessWithLlm(config, modelPath, instruction, content);
-                }
-                else
-                {
-                    // No initial instructions, but allow revisions
-                    AnsiConsole.WriteLine();
-                    AnsiConsole.MarkupLine("[bold cyan]Result:[/]");
-                    AnsiConsole.WriteLine(content);
-                    AnsiConsole.WriteLine();
-
-                    finalText = await ProcessRevisionsOnly(config, modelPath, content);
-                }
-            }
-            else
-            {
-                // No LLM available
-                finalText = content;
-            }
-
-            AnsiConsole.WriteLine();
 
             // Copy to clipboard
             if (config.Clipboard.Enabled)
@@ -421,200 +363,124 @@ internal class Program
         );
     }
 
-    private static async Task<string> ProcessRevisionsOnly(VoxConfig config, string modelPath, string initialText)
+    private static async Task<string> ProcessTranscriptionLoop(VoxConfig config, string modelPath)
     {
-        // Initialize LLM client
-        var llmConfig = new ConfigurationBuilder()
-            .AddInMemoryCollection(new Dictionary<string, string?>
-            {
-                ["ApiKey"] = config.Llm.ApiKey,
-                ["Model"] = config.Llm.Model
-            })
-            .Build();
-
-        var provider = new AnthropicProvider();
-        if (!provider.CanCreate(llmConfig))
-        {
-            return initialText;
-        }
-
-        var chatClient = provider.CreateClient(llmConfig);
-        var systemPrompt = BuildSystemPrompt(null);
-        var currentText = initialText;
-
-        // Enter revision loop
-        while (true)
-        {
-            AnsiConsole.MarkupLine("[dim]Press ENTER to revise/append, or ESC to accept and exit.[/]");
-
-            var key = Console.ReadKey(true);
-            if (key.Key == ConsoleKey.Escape)
-            {
-                break;
-            }
-            else if (key.Key != ConsoleKey.Enter)
-            {
-                continue;
-            }
-
-            // Record revision (same flow as initial recording)
-            AnsiConsole.MarkupLine("[dim]Press TAB to change input modes. Press ENTER when done speaking.[/]");
-
-            var revisionResult = RecordAudio(config);
-
-            if (revisionResult.AudioData.Length == 0)
-            {
-                AnsiConsole.MarkupLine("[yellow]No audio detected, keeping current version.[/]");
-                break;
-            }
-
-            // Transcribe revision
-            List<TranscriptionSegment> revisionSegments = new();
-            await AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .SpinnerStyle(Style.Parse("cyan"))
-                .StartAsync("[cyan]Transcribing...[/]",
-                    async ctx => { revisionSegments = await TranscribeAudio(modelPath, revisionResult.AudioData, config); });
-
-            // Map segments to modes
-            var revisionLabeledSegments = MapSegmentsToModes(revisionSegments, revisionResult.ToggleEvents);
-            var (revisionInstruction, revisionContent) = FormatSegmentsAsXml(revisionLabeledSegments);
-
-            // Append any new content to current text
-            if (!string.IsNullOrEmpty(revisionContent))
-            {
-                currentText = currentText + "\n\n" + revisionContent;
-            }
-
-            // Apply any instructions
-            if (!string.IsNullOrEmpty(revisionInstruction))
-            {
-                await AnsiConsole.Status()
-                    .Spinner(Spinner.Known.Dots)
-                    .SpinnerStyle(Style.Parse("cyan"))
-                    .StartAsync("[cyan]Applying revision...[/]",
-                        async ctx => { currentText = await CallLlm(chatClient, systemPrompt, currentText, revisionInstruction); });
-            }
-
-            // Show updated result
-            AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[bold cyan]Updated:[/]");
-            AnsiConsole.WriteLine(currentText);
-            AnsiConsole.WriteLine();
-        }
-
-        return currentText;
-    }
-
-    private static async Task<string> ProcessWithLlm(VoxConfig config, string modelPath, string? instruction,
-        string content)
-    {
-        // Initialize LLM client
+        // Try to initialize LLM client
         IChatClient? chatClient = null;
-        try
+        if (config.Llm.Enabled && !string.IsNullOrEmpty(config.Llm.ApiKey))
         {
-            var llmConfig = new ConfigurationBuilder()
-                .AddInMemoryCollection(new Dictionary<string, string?>
-                {
-                    ["ApiKey"] = config.Llm.ApiKey,
-                    ["Model"] = config.Llm.Model
-                })
-                .Build();
-
-            var provider = new AnthropicProvider();
-            if (!provider.CanCreate(llmConfig))
+            try
             {
-                AnsiConsole.MarkupLine("[yellow]⚠ LLM not configured properly, using raw transcription[/]");
-                return content;
+                var llmConfig = new ConfigurationBuilder()
+                    .AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["ApiKey"] = config.Llm.ApiKey,
+                        ["Model"] = config.Llm.Model
+                    })
+                    .Build();
+
+                var provider = new AnthropicProvider();
+                if (provider.CanCreate(llmConfig))
+                {
+                    chatClient = provider.CreateClient(llmConfig);
+                }
             }
-
-            chatClient = provider.CreateClient(llmConfig);
-        }
-        catch (Exception ex)
-        {
-            AnsiConsole.MarkupLine($"[yellow]⚠ Failed to initialize LLM: {MarkupHelper.Sanitize(ex.Message)}[/]");
-            return content;
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[yellow]⚠ Failed to initialize LLM: {MarkupHelper.Sanitize(ex.Message)}[/]");
+            }
         }
 
-        // Build system prompt
-        var systemPrompt = BuildSystemPrompt(instruction);
+        string currentText = "";
+        string systemPrompt = "";
+        bool isFirstIteration = true;
 
-        // Initial processing
-        var currentText = "";
-        await AnsiConsole.Status()
-            .Spinner(Spinner.Known.Dots)
-            .SpinnerStyle(Style.Parse("cyan"))
-            .StartAsync("[cyan]Processing with LLM...[/]",
-                async ctx => { currentText = await CallLlm(chatClient, systemPrompt, content, null); });
-
-        // Show result
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[bold cyan]Result:[/]");
-        AnsiConsole.WriteLine(currentText);
-        AnsiConsole.WriteLine();
-
-        // Enter revision loop
         while (true)
         {
-            AnsiConsole.MarkupLine("[dim]Press ENTER to revise, or ESC to accept and exit.[/]");
-
-            // Check if user wants to revise
-            var key = Console.ReadKey(true);
-            if (key.Key == ConsoleKey.Escape)
+            // Prompt for continue/exit (after first iteration)
+            if (!isFirstIteration)
             {
-                // Exit revision loop
-                break;
-            }
-            else if (key.Key != ConsoleKey.Enter)
-            {
-                // Ignore other keys, wait for Enter or Escape
-                continue;
+                AnsiConsole.MarkupLine("[dim]Press ENTER to revise/append, or ESC to accept and exit.[/]");
+                var key = Console.ReadKey(true);
+                if (key.Key == ConsoleKey.Escape) break;
+                if (key.Key != ConsoleKey.Enter) continue;
             }
 
-            // Record revision (same flow as initial recording)
+            // Record audio
             AnsiConsole.MarkupLine("[dim]Press TAB to change input modes. Press ENTER when done speaking.[/]");
+            var recordingResult = RecordAudio(config);
 
-            var revisionResult = RecordAudio(config);
-
-            if (revisionResult.AudioData.Length == 0)
+            if (recordingResult.AudioData.Length == 0)
             {
+                if (isFirstIteration)
+                {
+                    AnsiConsole.MarkupLine("[red]No audio detected.[/]");
+                    return "";
+                }
                 AnsiConsole.MarkupLine("[yellow]No audio detected, keeping current version.[/]");
                 break;
             }
 
-            // Transcribe revision
-            List<TranscriptionSegment> revisionSegments = new();
+            // Transcribe
+            List<TranscriptionSegment> segments = new();
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
                 .SpinnerStyle(Style.Parse("cyan"))
                 .StartAsync("[cyan]Transcribing...[/]",
-                    async ctx => { revisionSegments = await TranscribeAudio(modelPath, revisionResult.AudioData, config); });
+                    async ctx => { segments = await TranscribeAudio(modelPath, recordingResult.AudioData, config); });
 
-            // Map segments to modes
-            var revisionLabeledSegments = MapSegmentsToModes(revisionSegments, revisionResult.ToggleEvents);
-            var (revisionInstruction, revisionContent) = FormatSegmentsAsXml(revisionLabeledSegments);
+            var labeledSegments = MapSegmentsToModes(segments, recordingResult.ToggleEvents);
+            var (instruction, content) = FormatSegmentsAsXml(labeledSegments);
 
-            // Append any new content to current text
-            if (!string.IsNullOrEmpty(revisionContent))
+            AnsiConsole.WriteLine();
+            foreach (var segment in labeledSegments)
             {
-                currentText = currentText + "\n\n" + revisionContent;
+                var modeColor = segment.Mode == RecordingMode.Content ? "green" : "yellow";
+                var modeName = MarkupHelper.Sanitize(segment.Mode.ToString());
+                var segmentText = MarkupHelper.Sanitize(segment.Text);
+                AnsiConsole.MarkupLine($"[{modeColor}]{modeName}:[/] {segmentText}");
+            }
+            AnsiConsole.WriteLine();
+            
+            if (isFirstIteration)
+            {
+                // Build system prompt with initial instruction (if any)
+                systemPrompt = BuildSystemPrompt(instruction);
             }
 
-            // Apply any instructions
-            if (!string.IsNullOrEmpty(revisionInstruction))
+            // Append any content
+            if (!string.IsNullOrEmpty(content))
             {
+                currentText = string.IsNullOrEmpty(currentText) ? content : currentText + "\n\n" + content;
+            }
+
+            // Determine if we should call the LLM
+            bool shouldCallLlm = chatClient != null &&
+                ((isFirstIteration && !string.IsNullOrEmpty(instruction)) ||
+                 (!isFirstIteration && !string.IsNullOrEmpty(instruction)));
+
+            if (shouldCallLlm)
+            {
+                string? revisionRequest = isFirstIteration ? null : instruction;
+                string spinnerText = "[cyan]Processing with LLM...[/]";
+
                 await AnsiConsole.Status()
                     .Spinner(Spinner.Known.Dots)
                     .SpinnerStyle(Style.Parse("cyan"))
-                    .StartAsync("[cyan]Applying revision...[/]",
-                        async ctx => { currentText = await CallLlm(chatClient, systemPrompt, currentText, revisionInstruction); });
+                    .StartAsync(spinnerText,
+                        async ctx => { currentText = await CallLlm(chatClient!, systemPrompt, currentText, revisionRequest); });
+                
+                // Show result (only if updated)
+                AnsiConsole.WriteLine();
+                AnsiConsole.MarkupLine("[bold cyan]AI revision:[/]");
+                AnsiConsole.WriteLine(currentText);
+                AnsiConsole.WriteLine();
             }
 
-            // Show updated result
-            AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[bold cyan]Updated:[/]");
-            AnsiConsole.WriteLine(currentText);
-            AnsiConsole.WriteLine();
+            isFirstIteration = false;
+
+            // If LLM is not available, exit after first iteration
+            if (chatClient == null) break;
         }
 
         return currentText;
