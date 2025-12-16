@@ -35,4 +35,6 @@ public class LlmConfig
     public string Provider { get; set; } = "Anthropic";
     public string? ApiKey { get; set; }
     public string Model { get; set; } = "claude-sonnet-4-20250514";
+    public string? Endpoint { get; set; }
+    public string? ChatDeploymentName { get; set; }
 }

@@ -9,6 +9,8 @@
 
     <ItemGroup>
         <PackageReference Include="Anthropic.SDK" Version="5.8.0" />
+        <PackageReference Include="Azure.AI.OpenAI" Version="2.3.0-beta.2" />
+        <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="9.9.1-preview.1.25474.6" />
         <PackageReference Include="Microsoft.Extensions.AI" Version="10.1.1" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.1" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.1" />
@@ -21,6 +23,9 @@
 
     <ItemGroup>
         <None Update="appsettings.json">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+        <None Update="system.md">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </None>
     </ItemGroup>

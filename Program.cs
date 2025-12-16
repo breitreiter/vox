@@ -375,11 +375,18 @@ internal class Program
                     .AddInMemoryCollection(new Dictionary<string, string?>
                     {
                         ["ApiKey"] = config.Llm.ApiKey,
-                        ["Model"] = config.Llm.Model
+                        ["Model"] = config.Llm.Model,
+                        ["Endpoint"] = config.Llm.Endpoint,
+                        ["ChatDeploymentName"] = config.Llm.ChatDeploymentName
                     })
                     .Build();
 
-                var provider = new AnthropicProvider();
+                IChatClientProvider provider = config.Llm.Provider?.ToLowerInvariant() switch
+                {
+                    "azureopenai" => new AzureOpenAIProvider(),
+                    _ => new AnthropicProvider()
+                };
+
                 if (provider.CanCreate(llmConfig))
                 {
                     chatClient = provider.CreateClient(llmConfig);
@@ -488,29 +495,22 @@ internal class Program
 
     private static string BuildSystemPrompt(string? instruction)
     {
-        var prompt = new StringBuilder();
-        prompt.AppendLine(
-            "You are a transcription refinement assistant. Your job is to refine spoken text into written prose.");
-        prompt.AppendLine();
-        prompt.AppendLine("CRITICAL GUIDELINES:");
-        prompt.AppendLine("- You are generating text AS the user, not FOR the user");
-        prompt.AppendLine("- Preserve the user's voice, tone, and style");
-        prompt.AppendLine("- Do NOT transform into corporate-speak or 'AI slop'");
-        prompt.AppendLine("- Only apply requested changes, don't over-edit");
-        prompt.AppendLine("- Remove filler words (um, uh, like) unless they add meaning");
-        prompt.AppendLine("- Fix grammar and punctuation for written form");
-        prompt.AppendLine();
+        var templatePath = Path.Combine(AppContext.BaseDirectory, "system.md");
 
-        if (!string.IsNullOrEmpty(instruction))
+        // Fall back to current directory if not found in app directory
+        if (!File.Exists(templatePath))
         {
-            prompt.AppendLine("INSTRUCTIONS FROM USER:");
-            prompt.AppendLine(instruction);
-            prompt.AppendLine();
+            templatePath = "system.md";
         }
 
-        prompt.AppendLine("When revising, apply ONLY the requested changes. Return only the refined text, no explanations.");
+        var template = File.ReadAllText(templatePath);
 
-        return prompt.ToString();
+        // Replace instruction placeholder
+        var instructionBlock = !string.IsNullOrEmpty(instruction)
+            ? $"INSTRUCTIONS FROM USER:\n{instruction}"
+            : "";
+
+        return template.Replace("{{INSTRUCTIONS}}", instructionBlock);
     }
 
     private static async Task<string> CallLlm(IChatClient client, string systemPrompt, string content,
